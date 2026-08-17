@@ -292,6 +292,15 @@ const server = http.createServer(async (req, res) => {
       created: 1786990648,
       owned_by: "opencode-gateway",
       context_window: MODEL_CONTEXT,
+      context_length: MODEL_CONTEXT,
+      max_model_len: MODEL_CONTEXT,
+      limits: { context: MODEL_CONTEXT, output: 128000 },
+      meta: {
+        context_length: MODEL_CONTEXT,
+        context_window: MODEL_CONTEXT,
+        limits: { context: MODEL_CONTEXT, output: 128000 },
+        max_model_len: MODEL_CONTEXT,
+      },
     });
     return json(res, 200, {
       object: "list",
