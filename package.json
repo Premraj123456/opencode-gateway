@@ -1,0 +1,12 @@
+{
+  "name": "opencode-gateway",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "OpenAI-compatible gateway for opencode free models (deepseek-v4-flash-free) with per-request proxy rotation",
+  "engines": { "node": ">=18.0.0" },
+  "scripts": {
+    "start": "node src/shim.mjs"
+  },
+  "license": "MIT"
+}

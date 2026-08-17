@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: opencode-gateway
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: MODEL
+        value: deepseek-v4-flash-free
+      - key: DIRECT_FALLBACK
+        value: "true"
+      - key: PORT
+        value: "9090"
+      - key: PROXY_LIST
+        sync: false
+      - key: API_KEY
+        sync: false
+      - key: REFRESH_URL
+        sync: false
