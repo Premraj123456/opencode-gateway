@@ -11,6 +11,14 @@ const TIMEOUT_MS = parseInt(process.env.TIMEOUT_MS || "12000", 10);
 const MAX_ATTEMPTS = parseInt(process.env.MAX_ATTEMPTS || "4", 10);
 const REFRESH_SECONDS = parseInt(process.env.REFRESH_SECONDS || "1800", 10);
 const REFRESH_URL = process.env.REFRESH_URL || "";
+const FORCE_MODEL = (process.env.FORCE_MODEL || "true").toLowerCase() !== "false";
+const MODEL_CONTEXT = parseInt(process.env.MODEL_CONTEXT_WINDOW || "200000", 10);
+const MODEL_ALIASES = (process.env.MODEL_ALIASES || "gpt-4o,gpt-4o-mini,gpt-4.1-mini")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+const resolveModel = (requested) => (FORCE_MODEL ? MODEL : requested || MODEL);
 
 const RAW_PROXIES = (process.env.PROXY_LIST || "")
   .split(/[\s,]+/)
@@ -177,7 +185,7 @@ function responsesSse(reqStream, res, model) {
 async function handleResponses(payload, res) {
   const wantStream = !!payload.stream;
   const messages = responsesToMessages(payload.input, payload.instructions);
-  const chatBody = { model: payload.model || MODEL, messages, stream: wantStream };
+  const chatBody = { model: resolveModel(payload.model), messages, stream: wantStream };
   if (payload.max_output_tokens) chatBody.max_tokens = payload.max_output_tokens;
   if (payload.temperature != null) chatBody.temperature = payload.temperature;
   if (payload.top_p != null) chatBody.top_p = payload.top_p;
@@ -278,16 +286,16 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (path === "/v1/models" || path === "/models") {
+    const mk = (id) => ({
+      id,
+      object: "model",
+      created: 1786990648,
+      owned_by: "opencode-gateway",
+      context_window: MODEL_CONTEXT,
+    });
     return json(res, 200, {
       object: "list",
-      data: [
-        {
-          id: MODEL,
-          object: "model",
-          created: 1786990648,
-          owned_by: "opencode-gateway",
-        },
-      ],
+      data: [mk(MODEL), ...MODEL_ALIASES.map((a) => mk(a))],
     });
   }
 
@@ -319,7 +327,7 @@ const server = http.createServer(async (req, res) => {
     return handleResponses(payload, res);
   }
 
-  payload.model = payload.model || MODEL;
+  payload.model = resolveModel(payload.model);
   const wantStream = !!payload.stream;
 
   let upstreamBody;

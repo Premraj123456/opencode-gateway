@@ -66,6 +66,9 @@ Paste the `OK|host:port` lines into `PROXY_LIST`.
 | `UPSTREAM_URL` | `https://opencode.ai/zen/v1/chat/completions` | Upstream OpenAI-compatible endpoint |
 | `USER_AGENT` | `opencode/1.18.9` | Header the gateway expects to see |
 | `API_KEY` | empty | Require Bearer/x-api-key auth when set |
+| `FORCE_MODEL` | `true` | Alias any requested model to `MODEL` upstream (client can ask for gpt-4o, gets your model) |
+| `MODEL_ALIASES` | `gpt-4o,gpt-4o-mini,gpt-4.1-mini` | Extra ids advertised in `/v1/models` with `context_window` |
+| `MODEL_CONTEXT_WINDOW` | `200000` | `context_window` advertised in `/v1/models` (e.g. hermes uses it for compression-model checks) |
 | `PROXY_LIST` | empty | `host:port` proxy pool (comma/newline) |
 | `DIRECT_FALLBACK` | `true` | Use direct connection after all proxies fail |
 | `MAX_ATTEMPTS` | `6` | Max proxy attempts per request |
