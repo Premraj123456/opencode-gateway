@@ -61,6 +61,24 @@ function toPlainText(parts) {
   return "";
 }
 
+function normalizeTools(tools) {
+  if (!Array.isArray(tools)) return tools;
+  return tools.map((t) => {
+    if (!t || typeof t !== "object") return t;
+    if (t.type === "function" && t.function && typeof t.function === "object") return t;
+    if (t.type === "function" && t.name) {
+      const fn = {
+        name: t.name,
+        description: t.description || "",
+        parameters: t.parameters || { type: "object", properties: {} },
+      };
+      if (t.strict != null) fn.strict = t.strict;
+      return { type: "function", function: fn };
+    }
+    return t;
+  });
+}
+
 function responsesToMessages(input, instructions) {
   const out = [];
   if (instructions) {
@@ -85,22 +103,36 @@ function responsesToMessages(input, instructions) {
 
 function buildResponsesObject(up, model) {
   const content = up.choices?.[0]?.message?.content || "";
+  const msg = up.choices?.[0]?.message || {};
   const usage = up.usage || {};
+  const output = [];
+  if (Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0) {
+    for (const tc of msg.tool_calls) {
+      output.push({
+        id: tc.id || "call_" + Date.now().toString(36),
+        type: "function_call",
+        status: "completed",
+        call_id: tc.id || "call_" + Date.now().toString(36),
+        name: tc.function?.name || "",
+        arguments: tc.function?.arguments || "",
+      });
+    }
+  } else {
+    output.push({
+      type: "message",
+      id: "msg_" + Date.now().toString(36),
+      status: "completed",
+      role: "assistant",
+      content: [{ type: "output_text", text: content, annotations: [] }],
+    });
+  }
   return {
     id: "resp_" + String(up.id || Date.now().toString(36)).replace(/^(chatcmpl|router)[-_]?/, ""),
     object: "response",
     created_at: up.created || Math.floor(Date.now() / 1000),
     status: "completed",
     model: up.model || model,
-    output: [
-      {
-        type: "message",
-        id: "msg_" + Date.now().toString(36),
-        status: "completed",
-        role: "assistant",
-        content: [{ type: "output_text", text: content, annotations: [] }],
-      },
-    ],
+    output,
     usage: {
       input_tokens: usage.prompt_tokens || 0,
       output_tokens: usage.completion_tokens || 0,
@@ -145,6 +177,7 @@ function responsesSse(reqStream, res, model) {
 
   let buf = "";
   let text = "";
+  const toolCalls = {};
   reqStream.on("data", (chunk) => {
     buf += chunk.toString("utf8");
     let idx;
@@ -161,23 +194,53 @@ function responsesSse(reqStream, res, model) {
         continue;
       }
       const delta = obj.choices?.[0]?.delta;
-      if (!delta || !delta.content) continue;
-      text += delta.content;
-      send("response.output_text.delta", { type: "response.output_text.delta", item_id: itemId, output_index: 0, content_index: 0, delta: delta.content });
+      if (!delta) continue;
+      if (delta.content) {
+        text += delta.content;
+        send("response.output_text.delta", { type: "response.output_text.delta", item_id: itemId, output_index: 0, content_index: 0, delta: delta.content });
+      }
+      if (Array.isArray(delta.tool_calls)) {
+        for (const tc of delta.tool_calls) {
+          const key = tc.index != null ? String(tc.index) : (tc.id || "0");
+          if (!toolCalls[key]) {
+            toolCalls[key] = { id: tc.id || `call_${key}_${Date.now().toString(36)}`, name: "", arguments: "" };
+            send("response.output_item.added", {
+              type: "response.output_item.added",
+              output_index: Object.keys(toolCalls).length,
+              item: { id: toolCalls[key].id, type: "function_call", status: "in_progress", call_id: toolCalls[key].id, name: "", arguments: "" },
+            });
+          }
+          if (tc.id) toolCalls[key].id = tc.id;
+          if (tc.function?.name) toolCalls[key].name += tc.function.name;
+          if (tc.function?.arguments != null) toolCalls[key].arguments += tc.function.arguments;
+        }
+      }
     }
   });
   reqStream.on("end", () => {
-    send("response.output_text.done", { type: "response.output_text.done", item_id: itemId, output_index: 0, content_index: 0, text });
-    send("response.content_part.done", {
-      type: "response.content_part.done",
-      item_id: itemId,
-      output_index: 0,
-      content_index: 0,
-      part: { type: "output_text", text, annotations: [] },
-    });
-    const msg = { id: itemId, type: "message", status: "completed", role: "assistant", content: [{ type: "output_text", text, annotations: [] }] };
-    send("response.output_item.done", { type: "response.output_item.done", output_index: 0, item: msg });
-    send("response.completed", { type: "response.completed", response: { id, object: "response", status: "completed", model, output: [msg], usage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 } } });
+    const calls = Object.values(toolCalls);
+    if (calls.length > 0) {
+      for (const tc of calls) {
+        send("response.output_item.done", {
+          type: "response.output_item.done",
+          output_index: 0,
+          item: { id: tc.id, type: "function_call", status: "completed", call_id: tc.id, name: tc.name, arguments: tc.arguments },
+        });
+      }
+      send("response.completed", { type: "response.completed", response: { id, object: "response", status: "completed", model, output: calls.map((tc) => ({ id: tc.id, type: "function_call", status: "completed", call_id: tc.id, name: tc.name, arguments: tc.arguments })), usage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 } } });
+    } else {
+      send("response.output_text.done", { type: "response.output_text.done", item_id: itemId, output_index: 0, content_index: 0, text });
+      send("response.content_part.done", {
+        type: "response.content_part.done",
+        item_id: itemId,
+        output_index: 0,
+        content_index: 0,
+        part: { type: "output_text", text, annotations: [] },
+      });
+      const msg = { id: itemId, type: "message", status: "completed", role: "assistant", content: [{ type: "output_text", text, annotations: [] }] };
+      send("response.output_item.done", { type: "response.output_item.done", output_index: 0, item: msg });
+      send("response.completed", { type: "response.completed", response: { id, object: "response", status: "completed", model, output: [msg], usage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 } } });
+    }
     res.end();
   });
 }
@@ -189,7 +252,7 @@ async function handleResponses(payload, res) {
   if (payload.max_output_tokens) chatBody.max_tokens = payload.max_output_tokens;
   if (payload.temperature != null) chatBody.temperature = payload.temperature;
   if (payload.top_p != null) chatBody.top_p = payload.top_p;
-  if (payload.tools) chatBody.tools = payload.tools;
+  if (payload.tools) chatBody.tools = normalizeTools(payload.tools);
   if (payload.tool_choice != null) chatBody.tool_choice = payload.tool_choice;
 
   const result = await gatewayRequest({
