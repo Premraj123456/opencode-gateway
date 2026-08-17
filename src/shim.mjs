@@ -401,6 +401,7 @@ const server = http.createServer(async (req, res) => {
 
   payload.model = resolveModel(payload.model);
   const wantStream = !!payload.stream;
+  if (payload.tools) payload.tools = normalizeTools(payload.tools);
 
   let upstreamBody;
   try {
