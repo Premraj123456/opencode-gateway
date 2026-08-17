@@ -114,22 +114,26 @@ function buildRequestLine(method, path, headers, bodyBuf) {
 }
 
 function collectBody(source, leftovers, stream) {
-  if (stream) {
-    const out = new PassThrough();
-    if (leftovers.length) out.write(leftovers);
-    source.pipe(out);
-    out.on("error", () => {});
-    return Promise.resolve({ terminated: false, stream: out });
-  }
-  return new Promise((resolve, reject) => {
-    const chunks = leftovers.length ? [leftovers] : [];
+  const chunks = leftovers.length ? [leftovers] : [];
+  const done = new Promise((resolve, reject) => {
     source.on("data", (ch) => chunks.push(ch));
     source.on("error", (e) => reject(e));
-    source.on("end", () => resolve({ terminated: false, buf: Buffer.concat(chunks) }));
+    source.on("end", () => resolve(Buffer.concat(chunks)));
     source.on("close", () => {
       if (!source.readableEnded) reject(new Error("upstream closed connection prematurely"));
     });
   });
+  if (!stream) return { stream: null, done };
+  const out = new PassThrough();
+  if (leftovers.length) out.write(leftovers);
+  source.on("data", (ch) => out.write(ch));
+  source.on("end", () => out.end());
+  source.on("error", () => {
+    try {
+      out.destroy();
+    } catch {}
+  });
+  return { stream: out, done };
 }
 
 export async function gatewayRequest({ proxyList = [], method = "POST", path = "/zen/v1/chat/completions", headers = {}, body = "", stream = false, timeoutMs = 20000, direct = true, maxAttempts = 6 } = {}) {
@@ -162,12 +166,11 @@ export async function gatewayRequest({ proxyList = [], method = "POST", path = "
         tlsSock.write(bodyBuf);
         const { status, headers: rh, leftovers } = await hp;
         attempts[attempts.length - 1].status = status;
-        const bodyRes = await collectBody(tlsSock, leftovers, stream);
-        if (bodyRes.terminated) failures.push({ p, status });
+        const bodyRes = collectBody(tlsSock, leftovers, stream);
         if (stream && status === 200) {
           return { status, headers: rh, bodyStream: bodyRes.stream, via: p };
         }
-        const full = bodyRes.buf.toString("utf8");
+        const full = (await bodyRes.done).toString("utf8");
         attempts[attempts.length - 1].status = status;
         if (status >= 200 && status < 300) return { status, headers: rh, body: full, via: p };
         if (status >= 300 && status < 500 && status !== 429) {
@@ -200,11 +203,11 @@ export async function gatewayRequest({ proxyList = [], method = "POST", path = "
         req.end();
       });
       const status = res.statusCode;
-      const bodyRes = await collectBody(res, Buffer.alloc(0), stream);
+      const bodyRes = collectBody(res, Buffer.alloc(0), stream);
       if (stream && status === 200) {
         return { status, headers: res.headers, bodyStream: bodyRes.stream, via: "direct" };
       }
-      const full = bodyRes.buf.toString("utf8");
+      const full = (await bodyRes.done).toString("utf8");
       return { status, headers: res.headers, body: full, via: "direct" };
     } catch (e) {
       failures.push({ direct: e.message });
