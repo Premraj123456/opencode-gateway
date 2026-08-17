@@ -38,6 +38,183 @@ function json(res, status, obj) {
   res.end(body);
 }
 
+function toPlainText(parts) {
+  if (typeof parts === "string") return parts;
+  if (Array.isArray(parts)) {
+    return parts
+      .map((p) => {
+        if (typeof p === "string") return p;
+        if (p && typeof p.text === "string") return p.text;
+        return "";
+      })
+      .join("\n");
+  }
+  if (parts && typeof parts.text === "string") return parts.text;
+  return "";
+}
+
+function responsesToMessages(input, instructions) {
+  const out = [];
+  if (instructions) {
+    const instr = toPlainText(instructions).trim();
+    if (instr) out.push({ role: "system", content: instr });
+  }
+  const items = Array.isArray(input) ? input : [input];
+  for (const it of items) {
+    if (typeof it === "string") out.push({ role: "user", content: it });
+    else if (it && it.type === "message") out.push({ role: it.role || "user", content: toPlainText(it.content) });
+    else if (it && it.type === "input_text") out.push({ role: "user", content: it.text });
+    else if (it && it.type === "function_call_output") out.push({ role: "tool", tool_call_id: it.call_id, content: String(it.output ?? "") });
+  }
+  const merged = [];
+  for (const m of out) {
+    const last = merged[merged.length - 1];
+    if (last && last.role === m.role && last.role !== "tool") last.content += "\n" + m.content;
+    else merged.push({ ...m });
+  }
+  return merged;
+}
+
+function buildResponsesObject(up, model) {
+  const content = up.choices?.[0]?.message?.content || "";
+  const usage = up.usage || {};
+  return {
+    id: "resp_" + String(up.id || Date.now().toString(36)).replace(/^(chatcmpl|router)[-_]?/, ""),
+    object: "response",
+    created_at: up.created || Math.floor(Date.now() / 1000),
+    status: "completed",
+    model: up.model || model,
+    output: [
+      {
+        type: "message",
+        id: "msg_" + Date.now().toString(36),
+        status: "completed",
+        role: "assistant",
+        content: [{ type: "output_text", text: content, annotations: [] }],
+      },
+    ],
+    usage: {
+      input_tokens: usage.prompt_tokens || 0,
+      output_tokens: usage.completion_tokens || 0,
+      total_tokens: usage.total_tokens || 0,
+    },
+  };
+}
+
+function responsesSse(reqStream, res, model) {
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream; charset=utf-8",
+    "Cache-Control": "no-cache",
+    Connection: "keep-alive",
+    "Access-Control-Allow-Origin": "*",
+  });
+  const id = "resp_" + Date.now().toString(36);
+  const itemId = "msg_" + Date.now().toString(36);
+  const send = (event, data) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  const responseSkel = (status) => ({ id, object: "response", status, model, output: [] });
+  send("response.created", { type: "response.created", response: responseSkel("in_progress") });
+  send("response.in_progress", { type: "response.in_progress", response: responseSkel("in_progress") });
+  send("response.output_item.added", {
+    type: "response.output_item.added",
+    output_index: 0,
+    item: { id: itemId, type: "message", status: "in_progress", role: "assistant", content: [] },
+  });
+  send("response.content_part.added", {
+    type: "response.content_part.added",
+    item_id: itemId,
+    output_index: 0,
+    content_index: 0,
+    part: { type: "output_text", text: "", annotations: [] },
+  });
+
+  const onError = (e) => {
+    try {
+      res.destroy();
+    } catch {}
+  };
+  reqStream.on("error", onError);
+  res.on("close", () => reqStream.destroy());
+
+  let buf = "";
+  let text = "";
+  reqStream.on("data", (chunk) => {
+    buf += chunk.toString("utf8");
+    let idx;
+    while ((idx = buf.indexOf("\n")) !== -1) {
+      const line = buf.slice(0, idx);
+      buf = buf.slice(idx + 1);
+      if (!line.startsWith("data: ")) continue;
+      const data = line.slice(6).trim();
+      if (data === "[DONE]") continue;
+      let obj;
+      try {
+        obj = JSON.parse(data);
+      } catch {
+        continue;
+      }
+      const delta = obj.choices?.[0]?.delta;
+      if (!delta || !delta.content) continue;
+      text += delta.content;
+      send("response.output_text.delta", { type: "response.output_text.delta", item_id: itemId, output_index: 0, content_index: 0, delta: delta.content });
+    }
+  });
+  reqStream.on("end", () => {
+    send("response.output_text.done", { type: "response.output_text.done", item_id: itemId, output_index: 0, content_index: 0, text });
+    send("response.content_part.done", {
+      type: "response.content_part.done",
+      item_id: itemId,
+      output_index: 0,
+      content_index: 0,
+      part: { type: "output_text", text, annotations: [] },
+    });
+    const msg = { id: itemId, type: "message", status: "completed", role: "assistant", content: [{ type: "output_text", text, annotations: [] }] };
+    send("response.output_item.done", { type: "response.output_item.done", output_index: 0, item: msg });
+    send("response.completed", { type: "response.completed", response: { id, object: "response", status: "completed", model, output: [msg], usage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 } } });
+    res.end();
+  });
+}
+
+async function handleResponses(payload, res) {
+  const wantStream = !!payload.stream;
+  const messages = responsesToMessages(payload.input, payload.instructions);
+  const chatBody = { model: payload.model || MODEL, messages, stream: wantStream };
+  if (payload.max_output_tokens) chatBody.max_tokens = payload.max_output_tokens;
+  if (payload.temperature != null) chatBody.temperature = payload.temperature;
+  if (payload.top_p != null) chatBody.top_p = payload.top_p;
+  if (payload.tools) chatBody.tools = payload.tools;
+  if (payload.tool_choice != null) chatBody.tool_choice = payload.tool_choice;
+
+  const result = await gatewayRequest({
+    proxyList,
+    path: upstreamPath,
+    body: JSON.stringify(chatBody),
+    stream: wantStream,
+    timeoutMs: TIMEOUT_MS,
+    direct: DIRECT_FALLBACK,
+    maxAttempts: MAX_ATTEMPTS,
+  });
+  if (result.via === "none") console.error(`[resp] all attempts failed ${result.body.slice(0, 300)}`);
+  else console.log(`[resp] via=${result.via} status=${result.status}`);
+
+  if (wantStream && result.status === 200 && result.bodyStream) {
+    return responsesSse(result.bodyStream, res, chatBody.model);
+  }
+  if (result.status >= 200 && result.status < 300) {
+    try {
+      const up = JSON.parse(result.body);
+      return json(res, result.status, buildResponsesObject(up, chatBody.model));
+    } catch {
+      return json(res, result.status, { error: { message: result.body } });
+    }
+  }
+  try {
+    const up = JSON.parse(result.body);
+    return json(res, result.status, up);
+  } catch {
+    return json(res, result.status, { error: { message: result.body } });
+  }
+}
+
 function assertAuth(req, res) {
   if (!API_KEY) return true;
   const bearer = req.headers["authorization"] || "";
@@ -114,8 +291,9 @@ const server = http.createServer(async (req, res) => {
     });
   }
 
+  const isResp = path === "/v1/responses" || path === "/responses";
   const isChat = path === "/v1/chat/completions" || path === "/chat/completions";
-  if (!isChat || method !== "POST") {
+  if ((!isResp && !isChat) || method !== "POST") {
     return json(res, 404, { error: { message: `not found: ${method} ${path}` } });
   }
 
@@ -135,6 +313,10 @@ const server = http.createServer(async (req, res) => {
     payload = JSON.parse(bodyRaw || "{}");
   } catch {
     return json(res, 400, { error: { message: "invalid JSON body" } });
+  }
+
+  if (isResp) {
+    return handleResponses(payload, res);
   }
 
   payload.model = payload.model || MODEL;
